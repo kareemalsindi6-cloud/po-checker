@@ -301,7 +301,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   const KEYWORDS = [
     ["spicy veg", "SPICYVEG"], ["spicy fried", "SPICYFRIED"], ["korean", "KCHEESE"], ["cheese", "KCHEESE"],
     ["hot", "HOTSPICY"], ["sausage", "SAUSAGE"], ["susage", "SAUSAGE"], ["sausg", "SAUSAGE"], ["sasage", "SAUSAGE"], ["teriyaki", "TERIYAKI"], ["chili", "SWEETCHILI"],
-    ["chilli", "SWEETCHILI"], ["bbq", "JBBQ"], ["curry", "CURRY"], ["spec", "SCHICKEN"],
+    ["chilli", "SWEETCHILI"], ["bbq", "JBBQ"], ["japanese", "JBBQ"], ["jpn", "JBBQ"], ["sweet", "SWEETCHILI"], ["lemon", "SWEETCHILI"], ["beef", "TERIYAKI"], ["curry", "CURRY"], ["spec", "SCHICKEN"],
     ["chkn", "SCHICKEN"], ["chicken", "SCHICKEN"], ["goreng", "FRIED"], ["fried", "FRIED"], ["veg", "VEG"],
   ];
 
@@ -590,7 +590,9 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     }
     const NUM = /^-?[\d,]*\.?\d+$/;
     let skipped = 0, conflicts = 0, ambiguous = 0;
-    for (const l of L) {
+    const items = [];   // { li, line, own } – used afterwards to rebuild product names that wrap over several lines
+    for (let li = 0; li < L.length; li++) {
+      const l = L[li];
       const bm = l.match(/\b(\d{12,14})\b/); if (!bm) continue;
       const after = l.slice(bm.index + bm[1].length);
       const toks = after.split(/\s+/).filter(Boolean);
@@ -624,8 +626,26 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       const desc = after.split(/\s+(?=-?[\d,]*\.?\d+\s)/)[0].replace(/\b(EA|PCS?|CTN|CAR|CS|CASE|D4|A3)\b.*$/i, "").trim();
       const bu = unitOfBarcode(bm[1]);
       if (kel && bu && bu !== best.unit) conflicts++;
-      po.lines.push(newLine({ desc, barcode: bm[1], qty: best.qty, uom: best.unit, price: best.price, total: best.total }, S));
+      const line = newLine({ desc, barcode: bm[1], qty: best.qty, uom: best.unit, price: best.price, total: best.total }, S);
+      po.lines.push(line); items.push({ li, line, own: desc });
     }
+    // Product names often wrap: part of the name sits on the lines above / below the barcode line.
+    const isText = t => t && !/\b\d{12,14}\b/.test(t) && (t.match(/\b[\d,]*\.?\d+\b/g) || []).length <= 2 &&
+      !/barcode|product|unit\s*cost|qty|quantity|amt|vat|sku|total|page|description/i.test(t);
+    items.forEach((it, k) => {
+      const prev = k ? items[k - 1].li : Math.max(-1, it.li - 4), next = k < items.length - 1 ? items[k + 1].li : Math.min(L.length, it.li + 4);
+      const gapAbove = it.li - prev - 1, gapBelow = next - it.li - 1;
+      const above = L.slice(it.li - (k ? Math.floor(gapAbove / 2) : gapAbove), it.li).filter(isText);
+      const below = L.slice(it.li + 1, it.li + 1 + (k < items.length - 1 ? Math.ceil(gapBelow / 2) : gapBelow));
+      const belowTxt = []; for (const t of below) { if (!isText(t)) break; belowTxt.push(t); }
+      const full = [...above, it.own, ...belowTxt].join(" ").replace(/\s+/g, " ").trim();
+      if (full) it.line.desc = full;
+      const known = S.barcodes[digits(it.line.barcode)];
+      if (!known && it.line.family !== "OTHER") {
+        const fam = familyOf(it.own, "", S) || familyOf(full, "", S);
+        if (fam) it.line.family = fam;
+      }
+    });
     if (po.lines.length) po.warnings.push("Read with the general reader – please double-check the lines against the PO.");
     else { po.auto = false; po.format = "Unknown PDF layout"; po.warnings.push("This PDF layout is not known yet – please enter the lines manually."); po.rawText = T.slice(0, 4000); }
     if (skipped && po.lines.length) po.warnings.push(`${skipped} line(s) with a barcode could not be read – check for missing items.`);
@@ -1044,6 +1064,18 @@ function onPOInput(e){
     const l = po.lines[+t.dataset.l], f = t.dataset.lf;
     if (f === "qty" || f === "price") { const v = parseFloat(t.value.replace(/,/g, "")); l[f] = isNaN(v) ? null : v; l.total = null; }
     else l[f] = t.value;
+    if (f === "family" && l.barcode && C.FAMILY_NAME[l.family] && C.isKelloggs(l.desc, l.barcode)) {
+      // remember this barcode, so it is recognised automatically next time
+      const b = C.digits(l.barcode);
+      if (S.barcodes[b] !== l.family) {
+        S.barcodes[b] = l.family; saveSettings();
+        let n = 0; state.pos.forEach(p => p.lines.forEach(x => { if (x !== l && C.digits(x.barcode) === b && (!x.family || x.family === "?")) { x.family = l.family; n++; } }));
+        const msg = card.querySelector(".learn") || Object.assign(document.createElement("div"), { className: "note learn" });
+        msg.textContent = `Saved: barcode ${b} = ${C.FAMILY_NAME[l.family]}. It will be recognised automatically from now on${n ? ` (also filled on ${n} other line${n > 1 ? "s" : ""})` : ""}.`;
+        card.querySelector(".po-body table, .po-body .edit")?.closest("div").before(msg);
+        if (n) setTimeout(renderPOs, 1500);
+      }
+    }
     if (f === "desc" && (!l.family || l.family === "?")) {
       const fam = C.isKelloggs(l.desc, l.desc) ? C.familyOf(l.desc, l.desc, S) : "";
       if (fam) { l.family = fam; const sel = card.querySelector(`select[data-l="${t.dataset.l}"][data-lf="family"]`); if (sel) sel.value = fam; }
