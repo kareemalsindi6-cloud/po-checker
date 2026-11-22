@@ -79,7 +79,7 @@ table.edit td input.n{text-align:right}
 .scroll{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:8px}
 tr.sev-High td{background:var(--hi-bg)} tr.sev-Medium td{background:var(--med-bg)} tr.sev-Low td{background:var(--low-bg)}
 tr.sev-Check td{background:var(--chk-bg)} tr.sev-Info td{background:var(--info-bg)}
-tr.r-ok td.res{color:var(--ok);font-weight:700} tr.r-wait td.res{color:var(--med);font-weight:700} tr.r-bad td.res{color:var(--hi);font-weight:700}
+tr.r-ok td.res{color:var(--ok);font-weight:700} tr.r-wait td.res{color:var(--med);font-weight:700} tr.r-inv td.res{color:var(--low);font-weight:700} tr.r-bad td.res{color:var(--hi);font-weight:700}
 .filters{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
 .filters label{font-size:12.5px;border:1px solid var(--line);border-radius:14px;padding:2px 9px;cursor:pointer;user-select:none}
 .empty{padding:24px;text-align:center;color:var(--muted)}
@@ -414,12 +414,24 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         qty: num(g(r, "Quantity")) || 0, price: num(g(r, "Unit Price")) || 0,
         disc: num(g(r, "Line Discount %")) || 0, amount: num(g(r, "Line Amount")) || 0 });
     }
+    const invoices = [];
+    if (wb.SheetNames.includes("Posted Sales Invoices")) {
+      rows = rowsOf(XLSX, wb.Sheets["Posted Sales Invoices"]);
+      [hr, h] = findHeader(rows, ["No.", "External Document No.", "Posting Date"]);
+      if (hr >= 0) for (const r of rows.slice(hr + 1)) {
+        const no = g(r, "No."); if (!no) continue;
+        invoices.push({ inv: String(no), ext: String(g(r, "External Document No.") ?? ""), postDate: parseDate(g(r, "Posting Date")),
+          orderNo: String(g(r, "Order No.") ?? ""), location: g(r, "Location Code") || "", cust: String(g(r, "Sell-to Customer Name") || ""),
+          qty: num(g(r, "Quantity")) || 0, amount: num(g(r, "Amount")) || 0, amountVat: num(g(r, "Amount Including VAT")) || 0,
+          delivered: parseDate(g(r, "Actual Delivery Date")), cancelled: g(r, "Cancelled") === true || String(g(r, "Cancelled")).toLowerCase() === "true" });
+      }
+    }
     let runDate = null;
     if (wb.SheetNames.includes("Options")) {
       for (const r of rowsOf(XLSX, wb.Sheets["Options"]))
         if (r && String(r[1] || "").trim().toLowerCase() === "todays date") runDate = parseDate(r[2]);
     }
-    return { sos, runDate };
+    return { sos, runDate, invoices };
   }
 
   // --------------------------------------------------------------- NINJA --
@@ -698,7 +710,16 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   const customerFromSO = (soName, S) => (S.customers.find(c => (c.so || []).some(k => k && String(soName).includes(k))) || {}).name || "";
   const nameHas = (name, kws) => kws.some(k => String(name).toLowerCase().includes(String(k).toLowerCase()));
 
-  function runCheck(pos, sos, runDate, S) {
+  function runCheck(pos, sos, runDate, S, invoices = []) {
+    const invByExt = {};
+    for (const iv of invoices) {
+      if (digits(iv.ext).length < 5) continue;     // placeholders like "OCTORDERS" / "BTC NOODLE" are not PO numbers
+      const k = normDoc(iv.ext); if (k) (invByExt[k] = invByExt[k] || []).push(iv);
+      const d = digits(iv.ext); if (d.length >= 6 && d !== k) (invByExt[d] = invByExt[d] || []).push(iv);
+    }
+    const invoicesFor = po => { const out = [];
+      for (const k of [normDoc(po.poNumber), digits(po.poNumber)]) for (const iv of invByExt[k] || []) if (k && !out.includes(iv)) out.push(iv);
+      return out; };
     const issues = [], lineRows = [], summary = [], baazeem = [];
     const byExt = {};
     for (const s of Object.values(sos)) {
@@ -726,7 +747,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return { ...p, hits, how: hits.length ? "PO number" : null };
     });
     for (const m of matches) {
-      if (m.hits.length || m.missing.length) continue;
+      if (m.hits.length || m.missing.length || invoicesFor(m.po).length) continue;   // already invoiced → never borrow another order
       const kws = custKeywords(m.po, S), pa = aggPO(m.kel);
       if (!kws.length || !Object.keys(pa).length) continue;
       const need = Math.ceil(Object.keys(pa).length / 2);   // at least half the PO's flavors must match exactly
@@ -751,6 +772,28 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       let effCust = po.customer;   // customer typed / read on the PO, or taken from the matched SO
       const add = (soid, cust, sev, type, detail, poVal = "", soVal = "", action = "") =>
         issues.push({ sev, po: poid, so: soid, customer: effCust, custSO: cust, type, detail, poVal: String(poVal), soVal: String(soVal), action });
+      const invs = po.poNumber ? invoicesFor(po) : [];
+      if (!m.hits.length && invs.length) {
+        // Not an open sales order any more: the PO has already been invoiced.
+        const live = invs.filter(iv => !iv.cancelled), iv = live[0] || invs[0];
+        effCust = po.customer || customerFromSO(iv.cust, S);
+        const ivAmt = live.reduce((a, x) => a + x.amount, 0), ivQty = live.reduce((a, x) => a + x.qty, 0);
+        const before = issues.length, A = (...a) => add(invs.map(x => x.inv).join(", "), iv.cust, ...a);
+        if (!live.length) A("High", "Invoice cancelled", `PO was invoiced on ${invs.map(x => x.inv).join(", ")} but the invoice is cancelled, and there is no open sales order.`, poid, invs.map(x => x.inv).join(", "), "Re-enter the order if it is still needed");
+        else {
+          if (live.length > 1) A("High", "Invoiced more than once", `This PO number appears on ${live.length} posted invoices: ${live.map(x => x.inv).join(", ")}.`, poid, live.map(x => x.inv).join(", "), "Check for a duplicate invoice – credit note if needed");
+          const tol = Math.max(S.totalTolAbs, S.totalTolPct / 100 * Math.max(pv, ivAmt));
+          const priced = !m.missing.length && !m.kel.some(l => l.noPrice) && pv > 0;
+          if (priced && !m.other.length && Math.abs(pv - ivAmt) > tol)
+            A("Medium", "Invoiced value differs from PO", "The posted invoice value (ex VAT) is different from the PO value. Item lines are not in the invoice sheet, so check the invoice lines.", fmtN(pv), fmtN(ivAmt), "Review the invoice against the PO");
+        }
+        const n = issues.slice(before).filter(i => i.sev !== "Info").length;
+        summary.push({ po: poid, customer: effCust, branch: po.branch || [po.branchToken, po.region].filter(Boolean).join(" · ") || iv.location, source: po.source,
+          so: invs.map(x => x.inv).join(", "), how: `Posted invoice${live.length ? ` · ${fmtD(iv.postDate)}` : " (cancelled)"}`, status: live.length ? "Invoiced" : "Invoice cancelled",
+          poCtn: pc, soCtn: ivQty, poVal: pv, soVal: ivAmt, n, result: n ? "INVOICED – CHECK" : "INVOICED",
+          invoice: { inv: invs.map(x => x.inv).join(", "), date: iv.postDate, orderNo: iv.orderNo, cust: iv.cust, location: iv.location, amount: ivAmt, amountVat: live.reduce((a, x) => a + x.amountVat, 0), delivered: iv.delivered } });
+        continue;
+      }
       if (m.missing.length) {
         add(m.hits.join(", "), m.hits.length ? sos[m.hits[0]].cust : "", "Check", "Not checked – needs input",
           `This PO was not checked because it is missing: ${m.missing.join(", ")}. Other POs are not affected.`, "", "", "Complete the PO in step 2 and run the check again");
@@ -768,6 +811,10 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (m.hits.length > 1) add(m.hits.join(", "), "", "High", "Duplicate entry", `This PO number appears on ${m.hits.length} sales orders.`, "", m.hits.join(", "), "Cancel the duplicate SO");
       for (const soid of m.hits) {
         const so = sos[soid], before = issues.length, A = (...a) => add(soid, so.cust, ...a);
+        for (const iv of invs.filter(x => !x.cancelled)) {
+          if (iv.orderNo === soid) A("Info", "Partly invoiced", `Part of this order is already invoiced on ${iv.inv} (${fmtD(iv.postDate)}); the SO shows what is still open.`, "", iv.inv, "");
+          else A("High", "PO already invoiced", `This PO was already invoiced on ${iv.inv} (${fmtD(iv.postDate)}, order ${iv.orderNo}). This sales order may be a duplicate.`, poid, iv.inv, "Check before invoicing – cancel the SO if it is a duplicate");
+        }
         if (m.how !== "PO number") A("Medium", "PO number missing on SO", "External Document No. on the SO does not carry the PO number (matched by content).", poid, so.ext, "Put the customer PO number in External Document No.");
         effCust = po.customer || customerFromSO(so.cust, S);
         const kws = po.customer ? custKeywords(po, S) : [];
@@ -817,8 +864,9 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     const order = { High: 0, Medium: 1, Low: 2, Check: 3, Info: 4 };
     issues.sort((a, b) => order[a.sev] - order[b.sev] || String(a.po).localeCompare(String(b.po)));
     const noPO = Object.values(sos).filter(s => s.orderDate === runDate && !used.has(s.so));
+    const invoiced = summary.filter(s => s.invoice);
     const ready = summary.filter(s => s.result === "OK").map(s => ({ ...s, cust: sos[s.so] ? sos[s.so].cust : "", location: sos[s.so] ? sos[s.so].location : "" }));
-    return { runDate, summary, issues, lineRows, noPO, baazeem, ready };
+    return { runDate, summary, issues, lineRows, noPO, baazeem, ready, invoiced };
   }
 
   // -------------------------------------------------------------- EXPORT --
@@ -830,12 +878,14 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length, c: head.length - 1 } }) };
       XLSX.utils.book_append_sheet(wb, ws, name);
     };
-    const ok = R.ready.length, ni = R.summary.filter(s => s.result === "NEEDS INPUT").length;
-    const top = [[`Kellogg's PO vs Sales Order check – ${fmtD(R.runDate)}`], [`POs loaded: ${R.summary.length} | Ready to invoice: ${ok} | With issues: ${R.summary.length - ok - ni} | Not checked (needs input): ${ni} | High issues: ${R.issues.filter(i => i.sev === "High").length} | Today's SOs with no PO: ${R.noPO.length}`], []];
+    const ok = R.ready.length, ni = R.summary.filter(s => s.result === "NEEDS INPUT").length, inv = (R.invoiced || []).length;
+    const top = [[`Kellogg's PO vs Sales Order check – ${fmtD(R.runDate)}`], [`POs loaded: ${R.summary.length} | Ready to invoice: ${ok} | Already invoiced: ${inv} | With issues: ${R.summary.filter(s => ["ISSUES", "MISSING", "INVOICED – CHECK"].includes(s.result)).length} | Not checked (needs input): ${ni} | High issues: ${R.issues.filter(i => i.sev === "High").length} | Today's SOs with no PO: ${R.noPO.length}`], []];
     const sh = ["PO No.", "Customer", "Branch / ship-to", "Source file", "SO No.", "Matched by", "SO status", "PO ctn", "SO ctn", "PO value (Kellogg's)", "SO value (Kellogg's)", "Issues", "Result"];
     const ws = XLSX.utils.aoa_to_sheet([...top, sh, ...R.summary.map(s => [s.po, s.customer, s.branch, s.source, s.so, s.how, s.status, +s.poCtn.toFixed(2), +s.soCtn.toFixed(2), +s.poVal.toFixed(2), +s.soVal.toFixed(2), s.n, s.result])]);
     ws["!cols"] = [16, 12, 30, 34, 12, 22, 15, 9, 9, 14, 14, 8, 10].map(w => ({ wch: w }));
     XLSX.utils.book_append_sheet(wb, ws, "Summary");
+    sheet("Already invoiced", ["PO No.", "Customer", "Invoice No.", "Posting date", "Order No.", "Invoice customer name", "Location", "PO value (Kellogg's)", "Invoice amount ex VAT", "Invoice incl. VAT", "Delivered", "Result"],
+      (R.invoiced || []).map(s => [s.po, s.customer, s.invoice.inv, fmtD(s.invoice.date), s.invoice.orderNo, s.invoice.cust, s.invoice.location, +s.poVal.toFixed(2), +s.invoice.amount.toFixed(2), +s.invoice.amountVat.toFixed(2), fmtD(s.invoice.delivered), s.result]), [16, 12, 14, 12, 12, 44, 12, 14, 14, 14, 11, 16]);
     sheet("Ready to invoice", ["SO No.", "PO No.", "Customer", "SO customer name", "Location", "Cartons", "Value ex VAT (Kellogg's)"],
       R.ready.map(r => [r.so, r.po, r.customer, r.cust, r.location, +r.soCtn.toFixed(2), +r.soVal.toFixed(2)]), [12, 16, 12, 44, 12, 9, 16]);
     sheet("Exceptions", ["Severity", "PO No.", "SO No.", "Customer", "SO customer name", "Issue", "Detail", "PO says", "SO says", "Action", "Fixed? (team)"],
@@ -932,9 +982,9 @@ async function addFiles(list){
       if (["xlsx","xls","xlsm"].includes(ext)) {
         const wb = XLSX.read(buf, { type: "array" });
         if (C.isSOWorkbook(wb)) {
-          const { sos, runDate } = C.parseSOWorkbook(XLSX, wb);
-          state.sos = sos; state.soFile = f.name; rec.kind = "SO";
-          rec.msg = `${Object.keys(sos).length} sales orders`;
+          const { sos, runDate, invoices } = C.parseSOWorkbook(XLSX, wb);
+          state.sos = sos; state.invoices = invoices || []; state.soFile = f.name; rec.kind = "SO";
+          rec.msg = `${Object.keys(sos).length} sales orders` + (state.invoices.length ? `, ${state.invoices.length} posted invoices` : "");
           if (runDate) $("#runDate").value = runDate;
         } else if (C.isNinjaWorkbook(XLSX, wb)) {
           const pos = C.parseNinjaWorkbook(XLSX, wb, f.name, S);
@@ -1116,16 +1166,17 @@ function updateButtons(){
 function run(){
   const blockers = state.pos.filter(po => !po.poNumber || !po.customer || po.lines.some(l => (l.qty || l.desc) && (!l.family || l.family === "?")));
   const runDate = $("#runDate").value || null;
-  state.result = C.runCheck(state.pos, state.sos, runDate, S);
+  state.result = C.runCheck(state.pos, state.sos, runDate, S, state.invoices || []);
   state.dirty = false; state.blockers = blockers; renderResults(); updateButtons();
   $("#results").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function renderResults(){
   const R = state.result; if (!R) return;
-  const ok = R.ready.length, ni = R.summary.filter(s => s.result === "NEEDS INPUT").length, bad = R.summary.length - ok - ni;
+  const inv = (R.invoiced || []).filter(s => s.result === "INVOICED").length;
+  const ok = R.ready.length, ni = R.summary.filter(s => s.result === "NEEDS INPUT").length, bad = R.summary.length - ok - ni - inv;
   const hi = R.issues.filter(i => i.sev === "High").length;
-  const cnt = { exc: R.issues.length, ready: R.ready.length, sum: R.summary.length, line: R.lineRows.length, nopo: R.noPO.length, baz: R.baazeem.length };
-  const tabs = [["exc","Exceptions"],["ready","Ready to invoice"],["sum","Summary"],["line","Line comparison"],["nopo","SOs without PO"],["baz","Baazeem items"]];
+  const cnt = { exc: R.issues.length, ready: R.ready.length, inv: (R.invoiced || []).length, sum: R.summary.length, line: R.lineRows.length, nopo: R.noPO.length, baz: R.baazeem.length };
+  const tabs = [["exc","Exceptions"],["ready","Ready to invoice"],["inv","Already invoiced"],["sum","Summary"],["line","Line comparison"],["nopo","SOs without PO"],["baz","Baazeem items"]];
   let body = "";
   if (curTab === "exc") {
     const rows = R.issues.filter(i => sevFilter.has(i.sev));
@@ -1137,9 +1188,14 @@ function renderResults(){
     body = R.ready.length ? `<p class="muted" style="margin-top:0">These sales orders match their PO exactly (customer, branch, items, quantities, prices, dates). They can be invoiced; problems on other POs do not affect them.</p><div class="scroll"><table><thead><tr><th>SO No.</th><th>PO No.</th><th>Customer</th><th>SO customer name</th><th>Location</th><th class="n">Cartons</th><th class="n">Value ex VAT</th></tr></thead><tbody>` +
       R.ready.map(r => `<tr class="r-ok"><td><b>${esc(r.so)}</b></td><td>${esc(r.po)}</td><td>${esc(r.customer)}</td><td dir="auto">${esc(r.cust)}</td><td>${esc(r.location)}</td><td class="n">${C.fmtQ(r.soCtn)}</td><td class="n">${C.fmtN(r.soVal)}</td></tr>`).join("") +
       `</tbody></table></div>` : `<div class="empty">No sales order is fully clean yet.</div>`;
+  } else if (curTab === "inv") {
+    const I = R.invoiced || [];
+    body = I.length ? `<p class="muted" style="margin-top:0">These POs are no longer open sales orders – they were found in <b>Posted Sales Invoices</b>. The invoice sheet has totals only, so the value is compared, not each item.</p><div class="scroll"><table><thead><tr><th>PO No.</th><th>Customer</th><th>Invoice No.</th><th>Posting date</th><th>Order No.</th><th>Invoice customer</th><th class="n">PO value</th><th class="n">Invoice ex VAT</th><th>Result</th></tr></thead><tbody>` +
+      I.map(s => `<tr class="${s.result === "INVOICED" ? "r-inv" : "r-bad"}"><td><b>${esc(s.po)}</b></td><td>${esc(s.customer)}</td><td>${esc(s.invoice.inv)}</td><td>${C.fmtD(s.invoice.date)}</td><td>${esc(s.invoice.orderNo)}</td><td dir="auto">${esc(s.invoice.cust)}</td><td class="n">${s.poVal ? C.fmtN(s.poVal) : "—"}</td><td class="n">${C.fmtN(s.invoice.amount)}</td><td class="res">${esc(s.result)}</td></tr>`).join("") +
+      `</tbody></table></div>` : `<div class="empty">None of today's POs was already invoiced.</div>`;
   } else if (curTab === "sum") {
     body = `<div class="scroll"><table><thead><tr><th>PO No.</th><th>Customer</th><th>Branch / ship-to</th><th>SO No.</th><th>Matched by</th><th>SO status</th><th class="n">PO ctn</th><th class="n">SO ctn</th><th class="n">PO value</th><th class="n">SO value</th><th class="n">Issues</th><th>Result</th></tr></thead><tbody>` +
-      R.summary.map(s => `<tr class="${s.result === "OK" ? "r-ok" : s.result === "NEEDS INPUT" ? "r-wait" : "r-bad"}"><td>${esc(s.po)}</td><td>${esc(s.customer)}</td><td>${esc(s.branch)}</td><td>${esc(s.so)}</td><td>${esc(s.how)}</td><td>${esc(s.status)}</td><td class="n">${C.fmtQ(s.poCtn)}</td><td class="n">${C.fmtQ(s.soCtn)}</td><td class="n">${C.fmtN(s.poVal)}</td><td class="n">${C.fmtN(s.soVal)}</td><td class="n">${s.n}</td><td class="res">${s.result}</td></tr>`).join("") + `</tbody></table></div>`;
+      R.summary.map(s => `<tr class="${s.result === "OK" ? "r-ok" : s.result === "NEEDS INPUT" ? "r-wait" : s.result === "INVOICED" ? "r-inv" : "r-bad"}"><td>${esc(s.po)}</td><td>${esc(s.customer)}</td><td>${esc(s.branch)}</td><td>${esc(s.so)}</td><td>${esc(s.how)}</td><td>${esc(s.status)}</td><td class="n">${C.fmtQ(s.poCtn)}</td><td class="n">${C.fmtQ(s.soCtn)}</td><td class="n">${C.fmtN(s.poVal)}</td><td class="n">${C.fmtN(s.soVal)}</td><td class="n">${s.n}</td><td class="res">${s.result}</td></tr>`).join("") + `</tbody></table></div>`;
   } else if (curTab === "line") {
     body = `<div class="scroll"><table><thead><tr><th>PO No.</th><th>SO No.</th><th>Customer</th><th>Item</th><th>SO code</th><th class="n">PO ctn</th><th class="n">SO ctn</th><th class="n">PO net/ctn</th><th class="n">SO net/ctn</th><th class="n">PO value</th><th class="n">SO value</th><th>Status</th></tr></thead><tbody>` +
       R.lineRows.map(r => `<tr class="${r.status === "OK" ? "r-ok" : "r-bad"}"><td>${esc(r.po)}</td><td>${esc(r.so)}</td><td>${esc(r.customer)}</td><td>${esc(r.item)}</td><td>${esc(r.codes)}</td><td class="n">${C.fmtQ(r.poCtn)}</td><td class="n">${C.fmtQ(r.soCtn)}</td><td class="n">${C.fmtN(r.poPrice)}</td><td class="n">${C.fmtN(r.soPrice)}</td><td class="n">${C.fmtN(r.poVal)}</td><td class="n">${C.fmtN(r.soVal)}</td><td class="res">${esc(r.status)}</td></tr>`).join("") + `</tbody></table></div>`;
@@ -1157,6 +1213,7 @@ function renderResults(){
       <div class="kpi"><div class="v">${R.summary.length}</div><div class="l">POs loaded · ${C.fmtD(R.runDate)}</div></div>
       <div class="kpi good"><div class="v">${ok}</div><div class="l">Ready to invoice</div></div>
       <div class="kpi ${bad ? "bad" : ""}"><div class="v">${bad}</div><div class="l">With issues (${hi} high)</div></div>
+      <div class="kpi"><div class="v" style="color:${inv ? "var(--low)" : "inherit"}">${inv}</div><div class="l">Already invoiced</div></div>
       <div class="kpi"><div class="v" style="color:${ni ? "var(--med)" : "inherit"}">${ni}</div><div class="l">Not checked – needs input</div></div>
       <div class="kpi ${R.noPO.length ? "bad" : ""}"><div class="v">${R.noPO.length}</div><div class="l">Today's SOs with no PO</div></div>
     </div>
